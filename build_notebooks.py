@@ -177,6 +177,8 @@ def setup_command(cfg: Config) -> str:
     # A single shell command, written as a heredoc inside JSON, matching TAAF's
     # setup hook contract.
     return f'''"$PYTHON" - <<'PYSETUP'
+import base64
+import io
 import json
 import os
 import shutil
@@ -360,6 +362,39 @@ def run_vllm_api_smoke_test() -> None:
     print("VLLM smoke test:", response["choices"][0]["message"].get("content", "").strip(), flush=True)
 
 
+def run_vllm_vision_smoke_test() -> None:
+    # The served model is a vision-fine-tuned VLM; a text-only request does not
+    # exercise the image path. Send a real PNG so a broken multimodal setup fails
+    # here at setup time instead of silently during the scored run.
+    from PIL import Image
+
+    image = Image.new("RGB", (8, 8))
+    palette = [(0, 0, 0), (255, 0, 0), (0, 255, 0), (0, 0, 255)]
+    pixels = image.load()
+    for y in range(8):
+        for x in range(8):
+            pixels[x, y] = palette[(x + y) % len(palette)]
+    image = image.resize((128, 128), Image.Resampling.NEAREST)
+    buffer = io.BytesIO()
+    image.save(buffer, format="PNG")
+    data_url = "data:image/png;base64," + base64.b64encode(buffer.getvalue()).decode("ascii")
+    payload = {{
+        "model": SERVED_MODEL_NAME,
+        "messages": [{{
+            "role": "user",
+            "content": [
+                {{"type": "text", "text": "Describe this image in one short sentence."}},
+                {{"type": "image_url", "image_url": {{"url": data_url}}}},
+            ],
+        }}],
+        "temperature": 0.0,
+        "max_tokens": 96,
+        "chat_template_kwargs": {{"enable_thinking": False}},
+    }}
+    response = request_json(f"{{VLLM_BASE_URL}}/chat/completions", payload=payload, timeout=180)
+    print("VLLM vision smoke test:", response["choices"][0]["message"].get("content", "").strip(), flush=True)
+
+
 print(f"vLLM wheelhouse path: {{WHEELHOUSE}}", flush=True)
 print(f"model path: {{MODEL_PATH}}", flush=True)
 missing = [str(path) for path in (WHEELHOUSE, MODEL_PATH) if not path.exists()]
@@ -367,6 +402,7 @@ if missing:
     raise FileNotFoundError("Missing attached path(s): " + ", ".join(missing))
 start_vllm_server()
 run_vllm_api_smoke_test()
+run_vllm_vision_smoke_test()
 setup_env_path = Path(os.environ["TAAF_KAGGLE_SETUP_ENV"])
 existing_setup_env = json.loads(setup_env_path.read_text(encoding="utf-8")) if setup_env_path.exists() else {{}}
 existing_setup_env.update({{
