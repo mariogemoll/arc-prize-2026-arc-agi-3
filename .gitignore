@@ -6,8 +6,16 @@ __pycache__/
 .ruff_cache/
 .pytest_cache/
 
+.python-version
+
 # Runtime caches (created by `make`/`make view`)
 .cache/
+
+# Generated Kaggle artifacts
+code/
+submission.ipynb
+kernel-metadata.json
+wheels/kernel-metadata.json
 
 # Node (figure tooling, if reintroduced)
 node_modules/
