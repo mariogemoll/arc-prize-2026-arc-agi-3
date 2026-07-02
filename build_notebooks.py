@@ -41,20 +41,23 @@ class Config:
     code_slug: str = "arc-prize-2026-arc-agi-3-code"
     submission_slug: str = "arc-prize-2026-arc-agi-3"
 
-    # Tufa's public share used this model dataset. Keep it attached separately
-    # from the wheel/code utility kernels.
-    model_dataset_ref: str = "driessmit1/vrfai-qwen3-6-27b-fp8-hf-snapshot"
+    # Kaggle Model handle for our merged perception VLM:
+    # owner/model/framework/instance/version.
+    model_source: str = "mariogemoll/arc-prize-2026-arc-agi-3-vlm/transformers/perception-512/1"
 
-    served_model_name: str = "vrfai/Qwen3.6-27B-FP8"
+    served_model_name: str = "arc-vlm"
     vllm_port: int = 1234
     vllm_max_model_len: int = 65536
     analyzer_context_window: int = 32768
     tensor_parallel_size: int = 1
+    multimodal_context: str = "current_grid"
+    multimodal_upscale: int = 8
 
     # Match Tufa's share notebook defaults.
     benchmark_label: str = "arc-prize-2026-arc-agi-3"
     true_submission_n_passes: int = 1
     interactive_n_passes: int = 1
+    submission_concurrency: int = 4
 
     @property
     def wheels_ref(self) -> str:
@@ -116,7 +119,7 @@ dest = Path("/kaggle/working")
 requirements = dest / "requirements.lock"
 requirements.write_text(
     "\\n".join([
-        "vllm==0.19.0",
+        "vllm==0.19.1",
         "torch==2.10.0",
         "flashinfer-python==0.6.6",
         "transformers",
@@ -184,7 +187,7 @@ import urllib.request
 from pathlib import Path
 
 WHEELHOUSE_REF = {cfg.wheels_ref!r}
-MODEL_REF = {cfg.model_dataset_ref!r}
+MODEL_REF = {cfg.model_source!r}
 SERVED_MODEL_NAME = {cfg.served_model_name!r}
 VLLM_HOST = "127.0.0.1"
 VLLM_PORT = {cfg.vllm_port}
@@ -209,16 +212,28 @@ def resolve_ref(ref: str) -> Path:
     mapped = input_paths().get(ref)
     if mapped is not None:
         return mapped
-    owner, slug = ref.split("/", 1)
-    for candidate in (
-        Path("/kaggle/input") / slug,
-        Path("/kaggle/input/datasets") / owner / slug,
-        Path("/kaggle/input/notebooks") / owner / slug,
-        Path("/kaggle/usr/lib/notebooks") / owner / slug,
-    ):
+    parts = ref.split("/")
+    candidates: list[Path] = []
+    if len(parts) == 5:
+        owner, model, framework, instance, version = parts
+        candidates.extend([
+            Path("/kaggle/input/models") / owner / model / framework / instance / version,
+            Path("/kaggle/input") / "models" / owner / model / framework / instance / version,
+        ])
+    elif len(parts) == 2:
+        owner, slug = parts
+        candidates.extend([
+            Path("/kaggle/input") / slug,
+            Path("/kaggle/input/datasets") / owner / slug,
+            Path("/kaggle/input/notebooks") / owner / slug,
+            Path("/kaggle/usr/lib/notebooks") / owner / slug,
+        ])
+    else:
+        candidates.append(Path("/kaggle/input") / ref.replace("/", "-"))
+    for candidate in candidates:
         if candidate.exists():
             return candidate
-    return Path("/kaggle/input") / slug
+    return candidates[0]
 
 
 WHEELHOUSE = resolve_ref(WHEELHOUSE_REF)
@@ -346,7 +361,7 @@ def run_vllm_api_smoke_test() -> None:
 
 
 print(f"vLLM wheelhouse path: {{WHEELHOUSE}}", flush=True)
-print(f"Qwen model path: {{MODEL_PATH}}", flush=True)
+print(f"model path: {{MODEL_PATH}}", flush=True)
 missing = [str(path) for path in (WHEELHOUSE, MODEL_PATH) if not path.exists()]
 if missing:
     raise FileNotFoundError("Missing attached path(s): " + ", ".join(missing))
@@ -377,8 +392,8 @@ existing_setup_env.update({{
     "LOCAL_ANALYZER_TOP_P": "0.95",
     "LOCAL_ANALYZER_TOP_K": "20",
     "LOCAL_ANALYZER_ENABLE_THINKING": "true",
-    "MULTIMODAL_CONTEXT": "current_grid",
-    "MULTIMODAL_UPSCALE": "4",
+    "MULTIMODAL_CONTEXT": {cfg.multimodal_context!r},
+    "MULTIMODAL_UPSCALE": {str(cfg.multimodal_upscale)!r},
 }})
 setup_env_path.write_text(json.dumps(existing_setup_env, indent=2), encoding="utf-8")
 PYSETUP'''
@@ -530,9 +545,9 @@ def build_submission(cfg: Config) -> None:
             "enable_gpu": True,
             "enable_internet": False,
             "competition_sources": [COMPETITION_SLUG],
-            "dataset_sources": [cfg.model_dataset_ref],
+            "dataset_sources": [],
             "kernel_sources": [cfg.wheels_ref, cfg.code_ref],
-            "model_sources": [],
+            "model_sources": [cfg.model_source],
         },
         HERE / "kernel-metadata.json",
     )
@@ -543,7 +558,7 @@ def render_share_notebook(cfg: Config) -> dict:
     nb = json.loads(SHARE_NOTEBOOK_TEMPLATE.read_text(encoding="utf-8"))
     replacements = {
         "__TAAF_KAGGLE_WORKING_DIR__": repr("/kaggle/working"),
-        "__TAAF_DATASET_SOURCES__": repr([cfg.model_dataset_ref]),
+        "__TAAF_DATASET_SOURCES__": repr([]),
         "__TAAF_KERNEL_SOURCES__": repr([cfg.wheels_ref, cfg.code_ref]),
         "__TAAF_DATASET_BUNDLE_MARKER__": repr(SOURCE_MARKER),
         "__TAAF_COMPETITION_WHEELHOUSE__": repr(COMPETITION_WHEELHOUSE),
@@ -561,12 +576,27 @@ def render_share_notebook(cfg: Config) -> dict:
     # source. Our workflow publishes it as the code utility notebook output, so
     # keep the rest of their notebook and only widen bundle discovery/mapping.
     nb["cells"][6]["source"] = locate_bundle_cell(cfg)
+    nb["cells"][8]["source"] = customization_hook_cell(cfg)
     return nb
+
+
+def customization_hook_cell(cfg: Config) -> str:
+    return f"""\
+# Inline customization hook.
+if hasattr(bm, "solver") and hasattr(bm.solver, "concurrency"):
+    old_concurrency = bm.solver.concurrency
+    bm.solver.concurrency = {cfg.submission_concurrency}
+    print(
+        f"taaf.kaggle: solver concurrency {{old_concurrency}} -> {{bm.solver.concurrency}}",
+        flush=True,
+    )
+"""
 
 
 def locate_bundle_cell(cfg: Config) -> str:
     return f"""\
-DATASET_SOURCES = [{cfg.model_dataset_ref!r}]
+DATASET_SOURCES = []
+MODEL_SOURCES = [{cfg.model_source!r}]
 KERNEL_SOURCES = [{cfg.wheels_ref!r}, {cfg.code_ref!r}]
 DATASET_BUNDLE_MARKER = {SOURCE_MARKER!r}
 SETUP_ENV_PATH = WORKING_DIR / "taaf_setup_env.json"
@@ -596,6 +626,14 @@ def _kernel_mount_candidates(ref: str) -> list[Path]:
     ]
 
 
+def _model_mount_candidates(ref: str) -> list[Path]:
+    owner, model, framework, instance, version = ref.split("/", 4)
+    return [
+        Path("/kaggle/input/models") / owner / model / framework / instance / version,
+        Path("/kaggle/input") / "models" / owner / model / framework / instance / version,
+    ]
+
+
 def _first_existing(candidates: list[Path]) -> Path | None:
     return next((c for c in candidates if c.exists()), None)
 
@@ -606,6 +644,9 @@ kaggle_input_paths: dict[str, str] = {{}}
 for ref in DATASET_SOURCES:
     candidates = _dataset_mount_candidates(ref)
     kaggle_input_paths[ref] = str(_first_existing(candidates) or candidates[0])
+for ref in MODEL_SOURCES:
+    candidates = _model_mount_candidates(ref)
+    kaggle_input_paths[ref] = str(_first_existing(candidates) or candidates[0])
 for ref in KERNEL_SOURCES:
     candidates = _kernel_mount_candidates(ref)
     resolved = BUNDLE_DIR if ref == {cfg.code_ref!r} else _first_existing(candidates)
@@ -614,6 +655,7 @@ for ref in KERNEL_SOURCES:
 setup_env = {{
     "TAAF_KAGGLE_INPUT_PATHS": json.dumps(kaggle_input_paths, sort_keys=True),
     "TAAF_KAGGLE_DATASET_SOURCES": json.dumps(DATASET_SOURCES),
+    "TAAF_KAGGLE_MODEL_SOURCES": json.dumps(MODEL_SOURCES),
     "TAAF_KAGGLE_KERNEL_SOURCES": json.dumps(KERNEL_SOURCES),
 }}
 os.environ.update(setup_env)
